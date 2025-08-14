@@ -128,4 +128,4 @@ HDBSCAN聚类结果保存在 `hdbscan_cluster_results/` 目录中，包括：
 
 ## 许可证
 
-本项目采用MIT许可证，详情请见LICENSE文件。
+本项目采用Apache-2.0许可证，详情请见LICENSE文件。
