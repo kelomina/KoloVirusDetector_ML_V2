@@ -11,6 +11,12 @@ from datetime import datetime
 MAX_FILE_SIZE =  256 * 1024
 PE_FEATURE_SIZE = 500
 
+ERROR_COUNT = 0
+
+def increment_error():
+    global ERROR_COUNT
+    ERROR_COUNT += 1
+
 def extract_byte_sequence(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -26,6 +32,7 @@ def extract_byte_sequence(file_path):
         full_sequence[:len(byte_sequence)] = byte_sequence
         return full_sequence
     except Exception:
+        increment_error()
         return None
 
 def calculate_byte_entropy(byte_sequence, block_size=1024):
@@ -133,6 +140,7 @@ def extract_file_attributes(file_path):
             missing_flags['byte_stats_missing'] = 1
 
     except Exception:
+        increment_error()
 
         feature_names = ['size', 'log_size', 'file_entropy_avg', 'file_entropy_min', 'file_entropy_max',
                         'file_entropy_range', 'file_entropy_std', 'file_entropy_q25', 'file_entropy_q75',
@@ -283,6 +291,7 @@ def extract_enhanced_pe_features(file_path):
                         features['executable_writable_sections'] = features.get('executable_writable_sections', 0) + 1
                         rwx_sections_count += 1
                 except Exception:
+                    increment_error()
                     pass
 
             features['section_names_count'] = len(section_names)
@@ -420,6 +429,7 @@ def extract_enhanced_pe_features(file_path):
                 features['has_large_trailing_data'] = 1 if trailing_data_size > 1024 * 1024 else 0
                 missing_flags['trailing_data_missing'] = 0
         except Exception:
+            increment_error()
             features['trailing_data_size'] = 0
             features['trailing_data_ratio'] = 0
             features['has_large_trailing_data'] = 0
@@ -431,11 +441,13 @@ def extract_enhanced_pe_features(file_path):
             features['header_size_ratio'] = pe_header_size / (features['size'] + 1)
             missing_flags['header_info_missing'] = 0
         except Exception:
+            increment_error()
             features['pe_header_size'] = 0
             features['header_size_ratio'] = 0
             missing_flags['header_info_missing'] = 1
 
     except Exception as e:
+        increment_error()
         default_keys = [
             'sections_count', 'symbols_count',
             'imports_count', 'exports_count', 'unique_imports', 'unique_dlls',
@@ -515,6 +527,7 @@ def extract_lightweight_pe_features(file_path):
         return feature_vector
 
     except Exception:
+        increment_error()
         return feature_vector
 
 def extract_combined_pe_features(file_path):
@@ -594,22 +607,24 @@ def extract_combined_pe_features(file_path):
 
 def process_file_worker(args):
     file_path, label, output_dir = args
+    before = ERROR_COUNT
 
     try:
         with open(file_path, 'rb') as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
     except Exception:
-        return {'filename': 'unknown', 'status': 'failed', 'error': f'Could not read file: {file_path}'}
+        increment_error()
+        return {'filename': 'unknown', 'status': 'failed', 'error': f'Could not read file: {file_path}', 'errors': ERROR_COUNT - before}
 
     filename = file_hash
     output_npz_path = os.path.join(output_dir, filename + '.npz')
 
     if os.path.exists(output_npz_path):
-        return {'filename': filename, 'status': 'skipped', 'label': label}
+        return {'filename': filename, 'status': 'skipped', 'label': label, 'errors': ERROR_COUNT - before}
 
     byte_sequence = extract_byte_sequence(file_path)
     if byte_sequence is None:
-        return {'filename': filename, 'status': 'failed', 'error': 'Could not read byte sequence.'}
+        return {'filename': filename, 'status': 'failed', 'error': 'Could not read byte sequence.', 'errors': ERROR_COUNT - before}
 
     pe_features = extract_combined_pe_features(file_path)
 
@@ -619,9 +634,10 @@ def process_file_worker(args):
             byte_sequence=byte_sequence,
             pe_features=pe_features
         )
-        return {'filename': filename, 'status': 'success', 'label': label}
+        return {'filename': filename, 'status': 'success', 'label': label, 'errors': ERROR_COUNT - before}
     except Exception as e:
-        return {'filename': filename, 'status': 'failed', 'error': str(e)}
+        increment_error()
+        return {'filename': filename, 'status': 'failed', 'error': str(e), 'errors': ERROR_COUNT - before}
 
 def extract_features_in_memory(input_file_path, max_file_size=256*1024):
 
@@ -638,6 +654,7 @@ def extract_features_in_memory(input_file_path, max_file_size=256*1024):
 
         return byte_sequence, pe_features
     except Exception as e:
+        increment_error()
         print(f"[!] Failed to extract in-memory features for file {input_file_path}: {e}")
         return None, None
     finally:
@@ -715,3 +732,6 @@ if __name__ == '__main__':
 
     with open(METADATA_FILE, 'w') as f:
         json.dump(file_to_label, f, indent=4)
+
+    total_errors = sum(r.get('errors', 0) for r in results)
+    print(f"\n[!] 本次运行共捕获到 {total_errors} 个错误")
