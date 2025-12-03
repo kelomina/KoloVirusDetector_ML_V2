@@ -696,4 +696,5 @@ if __name__ == '__main__':
             failed_count += 1
             
     with open(METADATA_FILE, 'w') as f:
+
         json.dump(file_to_label, f, indent=4)
