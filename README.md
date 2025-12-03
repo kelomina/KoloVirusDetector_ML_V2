@@ -71,27 +71,53 @@ pip install numpy pandas scikit-learn lightgbm matplotlib seaborn tqdm pefile to
 
 ## 使用方法
 
-### 1. 训练二分类模型
+### 1. 生成数据集并训练二分类模型
 
 ```bash
-python pretrain.py --data_dir data/processed_lightgbm --metadata_file data/metadata.json
+python feature_extractor_enhanced.py&python pretrain.py
 ```
 
 ### 2. 进行恶意软件家族聚类
 
 ```bash
-python finetune.py --features_file extracted_features.pkl --output_dir hdbscan_cluster_results
+python finetune.py --features-path extracted_features.pkl --save-dir hdbscan_cluster_results --plot-pca
 ```
 
 ### 3. 扫描文件
 
 ```bash
 # 扫描单个文件
-python scanner.py --model saved_models/lightgbm_model.txt --file /path/to/file.exe
+    python scanner.py --file-path 路径\sample.exe
 
-# 扫描整个目录
-python scanner.py --model saved_models/lightgbm_model.txt --dir /path/to/directory
+# 扫描整个目录（非递归/递归）
+    python scanner.py --dir-path 路径\dump_dir
+    python scanner.py --dir-path 路径\dump_dir --recursive
 ```
+
+### 4. 启动 HTTP 扫描服务
+
+若希望让其他程序（如 C++ 杀毒软件）通过网络调用扫描能力，可启动 FastAPI 服务：
+
+```bash
+pip install -r requirements.txt
+uvicorn scanner_service:app --host 0.0.0.0 --port 8000
+```
+
+常用端点：
+- `POST /scan/file`：接受 JSON `{ "file_path": "C:\\sample.exe" }`
+- `POST /scan/upload`：上传文件内容（multipart/form-data）进行扫描
+- `GET /health`：服务健康检查
+
+通过以下环境变量可以覆盖默认的模型与配置路径：
+
+| 变量名 | 作用 |
+| --- | --- |
+| `SCANNER_LIGHTGBM_MODEL_PATH` | LightGBM 模型文件路径 |
+| `SCANNER_CLUSTER_MAPPING_PATH` | 聚类映射文件路径 |
+| `SCANNER_FAMILY_NAMES_PATH` | 家族名称映射路径 |
+| `SCANNER_CACHE_PATH` | 扫描缓存文件路径 |
+| `SCANNER_MAX_FILE_SIZE` | 最大读取文件大小（字节） |
+| `SCANNER_SERVICE_PORT` | 直接运行 `scanner_service.py` 时的端口 |
 
 ## 模型性能
 
