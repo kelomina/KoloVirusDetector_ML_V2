@@ -17,9 +17,37 @@ def increment_error():
     global ERROR_COUNT
     ERROR_COUNT += 1
 
+def validate_path(path):
+    """
+    Validates and normalizes a file path to prevent path traversal attacks.
+    """
+    if not path:
+        return None
+    
+    # Normalize the path
+    normalized_path = os.path.normpath(path)
+    
+    # Check for null bytes
+    if '\0' in normalized_path:
+        return None
+        
+    # Check if path exists
+    if not os.path.exists(normalized_path):
+        return None
+        
+    return normalized_path
+
 def extract_byte_sequence(file_path):
+    valid_path = validate_path(file_path)
+    if not valid_path:
+        return None
+
     try:
-        with open(file_path, 'rb') as f:
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            raise ValueError("Invalid file path")
+
+        with open(valid_path, 'rb') as f:
             f.seek(8)
             byte_sequence = np.fromfile(f, dtype=np.uint8, count=MAX_FILE_SIZE - 8)
 
@@ -81,14 +109,18 @@ def extract_file_attributes(file_path):
     missing_flags = {}
 
     try:
-        stat = os.stat(file_path)
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            raise ValueError("Invalid file path")
+
+        stat = os.stat(valid_path)
         features['size'] = stat.st_size
         missing_flags['size_missing'] = 0
 
         features['log_size'] = np.log(stat.st_size + 1)
         missing_flags['log_size_missing'] = 0
 
-        with open(file_path, 'rb') as f:
+        with open(valid_path, 'rb') as f:
             sample_data = np.fromfile(f, dtype=np.uint8, count=10240)
 
         avg_entropy, min_entropy, max_entropy, block_entropies, entropy_std = calculate_byte_entropy(sample_data)
@@ -162,7 +194,11 @@ def extract_enhanced_pe_features(file_path):
     missing_flags = {}
 
     try:
-        pe = pefile.PE(file_path, fast_load=True)
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            raise ValueError("Invalid file path")
+
+        pe = pefile.PE(valid_path, fast_load=True)
 
         features['sections_count'] = len(pe.sections) if hasattr(pe, 'sections') else 0
         missing_flags['sections_count_missing'] = 0 if hasattr(pe, 'sections') else 1
@@ -417,7 +453,7 @@ def extract_enhanced_pe_features(file_path):
                                                           hasattr(pe, 'DIRECTORY_ENTRY_EXCEPTION')) else 1
 
         try:
-            with open(file_path, 'rb') as f:
+            with open(valid_path, 'rb') as f:
                 f.seek(0, 2)
                 file_size = f.tell()
                 pe_end_offset = pe.sections[-1].PointerToRawData + pe.sections[-1].SizeOfRawData if hasattr(pe, 'sections') and pe.sections else file_size
@@ -498,7 +534,11 @@ def extract_lightweight_pe_features(file_path):
 
     feature_vector = np.zeros(256, dtype=np.float32)
     try:
-        pe = pefile.PE(file_path, fast_load=True)
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            return feature_vector
+
+        pe = pefile.PE(valid_path, fast_load=True)
 
         if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
             for entry in pe.DIRECTORY_ENTRY_IMPORT:
@@ -610,7 +650,11 @@ def process_file_worker(args):
     before = ERROR_COUNT
 
     try:
-        with open(file_path, 'rb') as f:
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            raise ValueError("Invalid file path")
+
+        with open(valid_path, 'rb') as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
     except Exception:
         increment_error()
