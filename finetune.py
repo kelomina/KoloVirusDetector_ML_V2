@@ -6,9 +6,11 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
+import pickle
 
 try:
     import fast_hdbscan
@@ -22,6 +24,89 @@ except ImportError:
 
 from pretrain import MalwareDataset, extract_statistical_features, load_dataset
 from torch.utils.data import DataLoader
+
+class FamilyClassifier:
+    def __init__(self):
+        self.centroids = {}
+        self.thresholds = {}
+        self.family_names = {}
+        self.scaler = None
+
+    def fit(self, features, labels, family_names_map):
+        print("[*] Training family classifier...")
+        
+        self.scaler = StandardScaler()
+        features_scaled = self.scaler.fit_transform(features)
+        
+        unique_labels = np.unique(labels)
+        
+        for label in unique_labels:
+            if label == -1:
+                continue
+
+            mask = labels == label
+            cluster_features = features_scaled[mask]
+            
+            centroid = np.mean(cluster_features, axis=0)
+            self.centroids[int(label)] = centroid
+
+            dists = np.linalg.norm(cluster_features - centroid, axis=1)
+            limit_dist = np.percentile(dists, 95) if len(dists) > 0 else 0
+            self.thresholds[int(label)] = limit_dist * 1.2 if limit_dist > 0 else 1.0
+
+            self.family_names[int(label)] = family_names_map.get(int(label), f"Family_{label}")
+            
+        print(f"[+] Classifier trained on {len(self.centroids)} families")
+
+    def save(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'centroids': self.centroids,
+                'thresholds': self.thresholds,
+                'family_names': self.family_names,
+                'scaler': self.scaler
+            }, f)
+        print(f"[+] Family classifier saved to: {path}")
+
+    def load(self, path):
+        if not os.path.exists(path):
+            print(f"[!] Classifier model not found: {path}")
+            return False
+            
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+                self.centroids = data['centroids']
+                self.thresholds = data['thresholds']
+                self.family_names = data['family_names']
+                self.scaler = data.get('scaler')
+            return True
+        except Exception as e:
+            print(f"[!] Failed to load classifier: {e}")
+            return False
+
+    def predict(self, feature_vector):
+        if not self.centroids:
+            return None, "Model_Not_Loaded", True
+
+        if self.scaler:
+            feature_vector = self.scaler.transform([feature_vector])[0]
+
+        min_dist = float('inf')
+        best_label = None
+
+        for label, centroid in self.centroids.items():
+            dist = np.linalg.norm(feature_vector - centroid)
+            if dist < min_dist:
+                min_dist = dist
+                best_label = label
+
+        if best_label is not None:
+            threshold = self.thresholds[best_label]
+            if min_dist <= threshold:
+                return best_label, self.family_names[best_label], False
+        
+        return None, "New_Unknown_Family", True
 
 def load_features_from_pickle(pickle_path):
 
@@ -64,7 +149,19 @@ def filter_malicious_samples(features, labels, files):
 def perform_hdbscan_clustering(features, min_cluster_size=50, min_samples=10):
 
     print("[*] Performing clustering analysis using HDBSCAN...")
-    print(f"    [*] Feature dimension: {features.shape[1]}")
+    print(f"    [*] Original feature dimension: {features.shape[1]}")
+
+    print("    [*] Standardizing features...")
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+
+    if features_scaled.shape[1] > 50:
+        print("    [*] High feature dimension, reducing to 50 dimensions using PCA for better clustering...")
+        pca = PCA(n_components=50, random_state=42)
+        features_for_clustering = pca.fit_transform(features_scaled)
+        print(f"    [*] Reduced feature dimension: {features_for_clustering.shape[1]}")
+    else:
+        features_for_clustering = features_scaled
 
     print("    [*] Using fast_hdbscan multicore optimized version")
     clusterer = fast_hdbscan.HDBSCAN(
@@ -73,7 +170,7 @@ def perform_hdbscan_clustering(features, min_cluster_size=50, min_samples=10):
         cluster_selection_method='eom'
     )
 
-    labels = clusterer.fit_predict(features)
+    labels = clusterer.fit_predict(features_for_clustering)
 
     unique_labels = np.unique(labels)
     n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
@@ -127,23 +224,27 @@ def visualize_clusters(features, labels, save_path, plot_pca=False):
     print("[*] Generating clustering visualization...")
     print(f"    [*] Feature dimension: {features.shape[1]}")
 
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
     original_features = features.copy()
 
-    if features.shape[1] > 50:
+    if features_scaled.shape[1] > 50:
         print("    [*] High feature dimension, reducing to 50 dimensions using PCA")
         pca = PCA(n_components=50, random_state=42)
-        features = pca.fit_transform(features)
+        features_vis = pca.fit_transform(features_scaled)
+    else:
+        features_vis = features_scaled
 
-    if features.shape[0] > 10000:
+    if features_vis.shape[0] > 10000:
         print("    [*] Large number of samples, randomly sampling 10000 points for visualization")
-        indices = np.random.choice(features.shape[0], 10000, replace=False)
-        features = features[indices]
-        original_features = original_features[indices]
+        indices = np.random.choice(features_vis.shape[0], 10000, replace=False)
+        features_vis = features_vis[indices]
+        features_scaled = features_scaled[indices]
         labels = labels[indices]
 
     print("    [*] Using t-SNE for dimensionality reduction...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features)-1))
-    features_2d = tsne.fit_transform(features)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features_vis)-1))
+    features_2d = tsne.fit_transform(features_vis)
 
     plt.figure(figsize=(12, 10))
     colors = ['gray' if label == -1 else None for label in labels]
@@ -162,7 +263,7 @@ def visualize_clusters(features, labels, save_path, plot_pca=False):
         pca_save_path = save_path.replace('.png', '_pca.png')
         print("    [*] Generating additional PCA dimensionality reduction visualization...")
         pca_2d = PCA(n_components=2, random_state=42)
-        features_pca_2d = pca_2d.fit_transform(original_features)
+        features_pca_2d = pca_2d.fit_transform(features_scaled)
 
         plt.figure(figsize=(12, 10))
         scatter = plt.scatter(features_pca_2d[:, 0], features_pca_2d[:, 1], c=labels, cmap='tab20', alpha=0.7)
@@ -179,6 +280,9 @@ def visualize_clusters(features, labels, save_path, plot_pca=False):
 def explain_clustering_discrepancy(features, labels, sample_indices=None, num_samples=5):
 
     print("[*] Explaining visualization discrepancies in clustering results...")
+    
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
 
     if sample_indices is None:
         non_noise_indices = np.where(labels != -1)[0]
@@ -192,11 +296,11 @@ def explain_clustering_discrepancy(features, labels, sample_indices=None, num_sa
 
     print(f"    [*] Analyzing {len(sample_indices)} samples in different dimensional spaces")
 
-    print("    [*] Euclidean distances between samples in high-dimensional space:")
+    print("    [*] Euclidean distances between samples in high-dimensional space (Scaled):")
     for i, idx in enumerate(sample_indices):
         same_cluster = np.where(labels == labels[idx])[0]
         if len(same_cluster) > 1:
-            same_cluster_distances = [np.linalg.norm(features[idx] - features[j])
+            same_cluster_distances = [np.linalg.norm(features_scaled[idx] - features_scaled[j])
                                    for j in same_cluster if j != idx]
             avg_same_cluster_dist = np.mean(same_cluster_distances)
             print(f"        Sample {idx} average distance to same cluster samples: {avg_same_cluster_dist:.4f}")
@@ -204,7 +308,7 @@ def explain_clustering_discrepancy(features, labels, sample_indices=None, num_sa
         diff_cluster = np.where(labels != labels[idx])[0]
         diff_cluster = diff_cluster[diff_cluster != idx]
         if len(diff_cluster) > 0:
-            diff_cluster_distances = [np.linalg.norm(features[idx] - features[j])
+            diff_cluster_distances = [np.linalg.norm(features_scaled[idx] - features_scaled[j])
                                    for j in diff_cluster[:100]]
             avg_diff_cluster_dist = np.mean(diff_cluster_distances)
             print(f"        Sample {idx} average distance to different cluster samples: {avg_diff_cluster_dist:.4f}")
@@ -310,8 +414,12 @@ def main(args):
     family_analysis = analyze_clusters(malicious_files, cluster_labels, args.min_family_size, args.treat_noise_as_family)
     family_names = identify_new_families(malicious_files, cluster_labels, args.save_dir, args.min_family_size, args.treat_noise_as_family)
 
-    print("\n[*] Step 6/6: Saving clustering results...")
+    print("\n[*] Step 6/6: Saving clustering results and training classifier...")
     save_clustering_results(malicious_files, cluster_labels, args.save_dir)
+
+    classifier = FamilyClassifier()
+    classifier.fit(malicious_features, cluster_labels, family_names)
+    classifier.save(os.path.join(args.save_dir, 'family_classifier.pkl'))
 
     visualize_clusters(malicious_features, cluster_labels,
                       os.path.join(args.save_dir, 'hdbscan_clustering_visualization.png'),
