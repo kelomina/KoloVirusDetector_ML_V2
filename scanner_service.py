@@ -13,10 +13,26 @@ from scanner import MalwareScanner
 
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.abspath('.'))
 DEFAULT_LIGHTGBM_MODEL = os.path.join(BASE_DIR, 'saved_models', 'lightgbm_model.txt')
-DEFAULT_CLUSTER_MAPPING = os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'file_cluster_mapping.json')
-DEFAULT_FAMILY_MAPPING = os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'family_names_mapping.json')
+DEFAULT_FAMILY_CLASSIFIER = os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'family_classifier.pkl')
 DEFAULT_CACHE_PATH = os.path.join(BASE_DIR, 'scan_cache.json')
 DEFAULT_MAX_FILE_SIZE = 256 * 1024
+
+ALLOWED_SCAN_ROOT = os.getenv('SCANNER_ALLOWED_SCAN_ROOT')
+
+def _validate_user_path(path: str) -> Optional[str]:
+    if not path:
+        return None
+    normalized = os.path.normpath(path)
+    if '\0' in normalized:
+        return None
+    abs_path = os.path.abspath(normalized)
+    if ALLOWED_SCAN_ROOT:
+        base = os.path.abspath(ALLOWED_SCAN_ROOT)
+        if not abs_path.startswith(base + os.sep) and abs_path != base:
+            return None
+    if not os.path.exists(abs_path):
+        return None
+    return abs_path
 
 
 def _env_int(name: str, default: int) -> int:
@@ -40,13 +56,12 @@ def _prefer_gz(path: str) -> str:
 
 def _build_scanner() -> MalwareScanner:
     lightgbm_model_path = _prefer_gz(os.getenv('SCANNER_LIGHTGBM_MODEL_PATH', DEFAULT_LIGHTGBM_MODEL))
-    cluster_mapping_path = _prefer_gz(os.getenv('SCANNER_CLUSTER_MAPPING_PATH', DEFAULT_CLUSTER_MAPPING))
-    family_names_path = _prefer_gz(os.getenv('SCANNER_FAMILY_NAMES_PATH', DEFAULT_FAMILY_MAPPING))
+    family_classifier_path = _prefer_gz(os.getenv('SCANNER_FAMILY_CLASSIFIER_PATH', DEFAULT_FAMILY_CLASSIFIER))
     cache_file = os.getenv('SCANNER_CACHE_PATH', DEFAULT_CACHE_PATH)
     max_file_size = _env_int('SCANNER_MAX_FILE_SIZE', DEFAULT_MAX_FILE_SIZE)
 
     missing_paths: List[str] = [
-        p for p in [lightgbm_model_path, cluster_mapping_path, family_names_path]
+        p for p in [lightgbm_model_path, family_classifier_path]
         if not os.path.exists(p)
     ]
     if missing_paths:
@@ -54,8 +69,7 @@ def _build_scanner() -> MalwareScanner:
 
     return MalwareScanner(
         lightgbm_model_path=lightgbm_model_path,
-        cluster_mapping_path=cluster_mapping_path,
-        family_names_path=family_names_path,
+        family_classifier_path=family_classifier_path,
         max_file_size=max_file_size,
         cache_file=None,
         enable_cache=False,
@@ -87,11 +101,12 @@ def health() -> dict:
 @app.post('/scan/file')
 def scan_file(request: FileScanRequest) -> dict:
     scanner = get_scanner()
-    if not os.path.exists(request.file_path):
-        raise HTTPException(status_code=404, detail='文件不存在')
+    valid_path = _validate_user_path(request.file_path)
+    if not valid_path:
+        raise HTTPException(status_code=400, detail='路径不合法或不在允许的扫描目录内')
 
     with _scanner_lock:
-        result = scanner.scan_file(request.file_path)
+        result = scanner.scan_file(valid_path)
 
     if result is None:
         raise HTTPException(status_code=400, detail='文件不是有效的PE或扫描失败')
