@@ -10,10 +10,34 @@ import gzip
 import tempfile
 import shutil
 import argparse
+import pickle
+from sklearn.preprocessing import StandardScaler
 
 from feature_extractor_enhanced import extract_features_in_memory
 
 BASE_DIR = getattr(sys, '_MEIPASS', os.path.abspath('.'))
+
+def validate_path(path):
+    if not path:
+        return None
+
+    normalized_path = os.path.normpath(path)
+
+    if '\0' in normalized_path:
+        return None
+
+    abs_path = os.path.abspath(normalized_path)
+
+    allowed_root = os.getenv('SCANNER_ALLOWED_SCAN_ROOT')
+    if allowed_root:
+        base = os.path.abspath(allowed_root)
+        if not abs_path.startswith(base + os.sep) and abs_path != base:
+            return None
+
+    if not os.path.exists(abs_path):
+        return None
+
+    return abs_path
 
 def extract_statistical_features(byte_sequence, pe_features):
     byte_array = np.array(byte_sequence, dtype=np.uint8)
@@ -205,8 +229,56 @@ def extract_statistical_features(byte_sequence, pe_features):
 
     return np.array(features, dtype=np.float32)
 
+class FamilyClassifier:
+    def __init__(self):
+        self.centroids = {}
+        self.thresholds = {}
+        self.family_names = {}
+        self.scaler = None
+
+    def load(self, path):
+        if not os.path.exists(path):
+            print(f"[!] Classifier model not found: {path}")
+            return False
+            
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+                self.centroids = data['centroids']
+                self.thresholds = data['thresholds']
+                self.family_names = data['family_names']
+                self.scaler = data.get('scaler')
+            print(f"[+] Family classifier loaded, {len(self.centroids)} families")
+            return True
+        except Exception as e:
+            print(f"[!] Failed to load classifier: {e}")
+            return False
+
+    def predict(self, feature_vector):
+        if not self.centroids:
+            return None, "Model_Not_Loaded", True
+
+        if self.scaler:
+            feature_vector = self.scaler.transform(feature_vector.reshape(1, -1))[0]
+
+        min_dist = float('inf')
+        best_label = None
+
+        for label, centroid in self.centroids.items():
+            dist = np.linalg.norm(feature_vector - centroid)
+            if dist < min_dist:
+                min_dist = dist
+                best_label = label
+
+        if best_label is not None:
+            threshold = self.thresholds[best_label]
+            if min_dist <= threshold:
+                return best_label, self.family_names[best_label], False
+        
+        return None, "New_Unknown_Family", True
+
 class MalwareScanner:
-    def __init__(self, lightgbm_model_path, cluster_mapping_path, family_names_path,
+    def __init__(self, lightgbm_model_path, family_classifier_path,
                  max_file_size=256*1024, cache_file='scan_cache.json', enable_cache=True):
 
         self.max_file_size = max_file_size
@@ -224,19 +296,9 @@ class MalwareScanner:
         self._temp_model_path = model_path if model_path != lightgbm_model_path else None
         print("[+] LightGBM binary classification model loaded")
 
-        print("[*] Loading cluster mapping information...")
-        def _load_json_any(path):
-            if path.endswith('.gz'):
-                with gzip.open(path, 'rt', encoding='utf-8') as f:
-                    return json.load(f)
-            with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        self.cluster_mapping = _load_json_any(cluster_mapping_path)
-        print(f"[+] Cluster mapping information loaded, total {len(self.cluster_mapping)} files")
-
-        print("[*] Loading family name mapping...")
-        self.family_names = _load_json_any(family_names_path)
-        print(f"[+] Family name mapping loaded, total {len(self.family_names)} known families")
+        print("[*] Loading family classifier...")
+        self.family_classifier = FamilyClassifier()
+        self.family_classifier.load(family_classifier_path)
 
         self.scan_cache = self._load_cache()
         if self.enable_cache:
@@ -275,7 +337,11 @@ class MalwareScanner:
 
         sha256_hash = hashlib.sha256()
         try:
-            with open(file_path, "rb") as f:
+            valid_path = validate_path(file_path)
+            if not valid_path:
+                return None
+
+            with open(valid_path, "rb") as f:
                 for chunk in iter(lambda: f.read(4096), b""):
                     sha256_hash.update(chunk)
             return sha256_hash.hexdigest()
@@ -286,7 +352,11 @@ class MalwareScanner:
     def _is_pe_file(self, file_path):
 
         try:
-            with open(file_path, 'rb') as f:
+            valid_path = validate_path(file_path)
+            if not valid_path:
+                return False
+
+            with open(valid_path, 'rb') as f:
                 magic = f.read(2)
                 if magic != b'MZ':
                     return False
@@ -323,12 +393,7 @@ class MalwareScanner:
             print(f"[!] File preprocessing failed {file_path}: {e}")
             return None
 
-    def is_malware(self, file_path):
-
-        features = self._preprocess_file(file_path)
-        if features is None:
-            return False, 0.0
-
+    def _predict_malware_from_features(self, features):
         try:
             feature_vector = features.reshape(1, -1)
             prediction = self.binary_classifier.predict(feature_vector)
@@ -338,62 +403,62 @@ class MalwareScanner:
 
             return is_malware, confidence
         except Exception as e:
-            print(f"[!] Binary classification prediction failed {file_path}: {e}")
+            print(f"[!] Binary classification prediction failed: {e}")
             return False, 0.0
 
-    def predict_family(self, file_path):
+    def is_malware(self, file_path):
+        features = self._preprocess_file(file_path)
+        if features is None:
+            return False, 0.0
+        
+        return self._predict_malware_from_features(features)
 
-        file_name = os.path.basename(file_path) + '.npz'
-
-        if file_name in self.cluster_mapping:
-            cluster_id = self.cluster_mapping[file_name]
-            cluster_id_str = str(cluster_id)
-
-            if cluster_id_str in self.family_names:
-                family_name = self.family_names[cluster_id_str]
-                is_new_family = False
-            else:
-                family_name = f"New_Family_Cluster_{cluster_id}"
-                is_new_family = True
-
-            return cluster_id, family_name, is_new_family
-        else:
-            return None, "Unknown_Family", True
+    def predict_family(self, features):
+        return self.family_classifier.predict(features)
 
     def scan_file(self, file_path):
 
-        file_hash = self._calculate_sha256(file_path)
+        valid_path = validate_path(file_path)
+        if not valid_path:
+            print(f"[!] Invalid or non-existent file path: {file_path}")
+            return None
+
+        file_hash = self._calculate_sha256(valid_path)
         if file_hash is None:
-            print(f"[!] Unable to calculate file hash: {file_path}")
+            print(f"[!] Unable to calculate file hash: {valid_path}")
             return None
 
         if self.enable_cache and file_hash in self.scan_cache:
             cached_result = self.scan_cache[file_hash]
-            print(f"[*] Using cached result: {file_path}")
+            print(f"[*] Using cached result: {valid_path}")
             return cached_result
 
-        if not self._is_pe_file(file_path):
-            print(f"[-] Skipping non-PE file: {file_path}")
+        if not self._is_pe_file(valid_path):
+            print(f"[-] Skipping non-PE file: {valid_path}")
             return None
 
-        print(f"[*] Scanning file: {file_path}")
+        print(f"[*] Scanning file: {valid_path}")
 
-        is_malware, confidence = self.is_malware(file_path)
+        features = self._preprocess_file(valid_path)
+        if features is None:
+            return None
+
+        is_malware, confidence = self._predict_malware_from_features(features)
 
         result = {
-            'file_path': file_path,
-            'file_name': os.path.basename(file_path),
-            'file_size': os.path.getsize(file_path),
+            'file_path': valid_path,
+            'file_name': os.path.basename(valid_path),
+            'file_size': os.path.getsize(valid_path),
             'is_malware': bool(is_malware),
             'confidence': float(confidence),
         }
 
         if is_malware:
-            cluster_id, family_name, is_new_family = self.predict_family(file_path)
+            cluster_id, family_name, is_new_family = self.predict_family(features)
 
             result.update({
                 'malware_family': {
-                    'cluster_id': cluster_id,
+                    'cluster_id': int(cluster_id) if cluster_id is not None else -1,
                     'family_name': family_name,
                     'is_new_family': bool(is_new_family)
                 }
@@ -475,12 +540,9 @@ def main():
     parser.add_argument('--lightgbm-model-path', type=str,
                        default=os.path.join(BASE_DIR, 'saved_models', 'lightgbm_model.txt'),
                        help='LightGBM binary classification model path')
-    parser.add_argument('--cluster-mapping-path', type=str,
-                       default=os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'file_cluster_mapping.json'),
-                       help='Cluster mapping file path')
-    parser.add_argument('--family-names-path', type=str,
-                       default=os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'family_names_mapping.json'),
-                       help='Family name mapping file path')
+    parser.add_argument('--family-classifier-path', type=str,
+                       default=os.path.join(BASE_DIR, 'hdbscan_cluster_results', 'family_classifier.pkl'),
+                       help='Family classifier pickle path')
     parser.add_argument('--cache-file', type=str, default=os.path.join(BASE_DIR, 'scan_cache.json'),
                        help='Scan cache file path')
 
@@ -499,18 +561,13 @@ def main():
         print(f"[!] Error: LightGBM model file not found {args.lightgbm_model_path}")
         return
 
-    if not os.path.exists(args.cluster_mapping_path):
-        print(f"[!] Error: Cluster mapping file not found {args.cluster_mapping_path}")
-        return
-
-    if not os.path.exists(args.family_names_path):
-        print(f"[!] Error: Family name mapping file not found {args.family_names_path}")
+    if not os.path.exists(args.family_classifier_path):
+        print(f"[!] Error: Family classifier file not found {args.family_classifier_path}")
         return
 
     scanner = MalwareScanner(
         lightgbm_model_path=args.lightgbm_model_path,
-        cluster_mapping_path=args.cluster_mapping_path,
-        family_names_path=args.family_names_path,
+        family_classifier_path=args.family_classifier_path,
         max_file_size=args.max_file_size,
         cache_file=args.cache_file,
         enable_cache=True,
